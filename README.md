@@ -16,11 +16,19 @@
 
 1. Скачайте последнюю папку: MapParser - .py version
 2. Установите необходимые зависимости:
-   pip install customtkinter
-   pip install playwright
-   pip install pandas
-   pip install openpyxl
+[a] pip install customtkinter
+[b] pip install playwright
+[c] pip install pandas
+[d] pip install openpyxl
 3. Запустите папку main.py использовав Python
+
+## 🚀 Как собрать .exe файл
+
+1. Установите необходимую зависимость:
+[a] pip install pyinstaller
+2. Используйте библиотеку pyinstaller из файла main.py:
+[b] pyinstaller --onefile --windowed --name="YandexMapsScanner" main.py
+3. Запустите .exe файл из корневой папки в которой так-же присуствует папка _internal (она создается после сборки автоматически)
 
 ## 📁 Выходной файл
 
