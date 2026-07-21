@@ -68,29 +68,40 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ======================= СОЦСЕТИ / ФИЛЬТРЫ =======================
 
+# Соцсети, которые реально оставляем (Instagram/WhatsApp/OK.ru — убраны по запросу)
 SOCIAL_PATTERNS = {
     "VK": re.compile(r'https?://(?:www\.)?vk\.com/[^\s"\'<>]+', re.I),
     "Telegram": re.compile(r'https?://(?:www\.)?t\.me/[^\s"\'<>]+', re.I),
-    "Instagram": re.compile(r'https?://(?:www\.)?instagram\.com/[^\s"\'<>]+', re.I),
-    "WhatsApp": re.compile(r'https?://(?:api\.|www\.)?wa\.me/[^\s"\'<>]+', re.I),
     "Facebook": re.compile(r'https?://(?:www\.)?facebook\.com/[^\s"\'<>]+', re.I),
-    "OK.ru": re.compile(r'https?://(?:www\.)?ok\.ru/[^\s"\'<>]+', re.I),
 }
 
+# Регекс по всей HTML-странице ловит не только реальную страницу организации
+# в VK/Telegram, но и кнопки "поделиться" (vk.com/share.php, t.me/share/url) —
+# они тоже matчатся паттерном выше, но это не соцсеть организации, а виджет
+# Яндекса. Отсеиваем такие совпадения по ключевым словам в самой ссылке.
+SOCIAL_EXCLUDE_KEYWORDS = ("share", "sharer", "widget", "away.php", "wall", "join?")
+
+# Домены/паттерны, которые точно не являются "сайтом организации":
+# сама Яндекс-экосистема, соцсети (уже учтены отдельно), агрегаторы отзывов,
+# картографические/поисковые сервисы, реклама и трекинг-домены.
 IGNORE_DOMAINS = (
-    "yandex.", "ya.ru", "vk.com", "t.me", "instagram.com",
-    "facebook.com", "wa.me", "ok.ru", "adfox", "mc.yandex",
+    "yandex.", "ya.ru", "yastatic.net", "mc.yandex", "an.yandex", "avatars.mds.yandex",
+    "vk.com", "t.me", "instagram.com", "facebook.com", "wa.me", "ok.ru",
+    "2gis.ru", "2gis.com", "zoon.ru", "flamp.ru", "otzovik.com", "irecommend.ru",
+    "tripadvisor.", "foursquare.com", "prodoctorov.ru", "napopravku.ru",
+    "restoclub.ru", "banki.ru", "google.com", "google-analytics.com",
+    "googletagmanager.com", "doubleclick.net", "adfox", "avito.ru", "youla.ru",
 )
 
 COLUMNS = [
     "Название", "Ссылка на карточку", "Адрес", "Телефон",
     "Есть сайт", "Сайт", "Рейтинг", "Кол-во отзывов",
-    "VK", "Telegram", "Instagram", "WhatsApp", "Facebook", "OK.ru",
+    "VK", "Telegram", "Facebook",
 ]
 
 TABLE_COLUMNS = [
     "Название", "Адрес", "Телефон", "Сайт", "Рейтинг", "Отзывы",
-    "VK", "Telegram", "Instagram", "WhatsApp", "Facebook", "OK.ru",
+    "VK", "Telegram", "Facebook",
 ]
 
 
@@ -157,6 +168,7 @@ def collect_card_links(page, max_results, log_fn, stop_flag):
     stagnant_rounds = 0
     last_count = 0
 
+    stopped_early = False
     while len(links) < max_results and stagnant_rounds < 5:
         if stop_flag.is_set():
             log_fn("Остановлено пользователем.")
@@ -169,6 +181,8 @@ def collect_card_links(page, max_results, log_fn, stop_flag):
             if href:
                 if href.startswith("/"):
                     href = "https://yandex.ru" + href
+                # ссылки на одну и ту же карточку различаются только query-параметрами —
+                # без них исключаем дубликаты сразу на этапе сбора
                 links.add(href.split("?")[0])
 
         if len(links) == last_count:
@@ -176,6 +190,10 @@ def collect_card_links(page, max_results, log_fn, stop_flag):
         else:
             stagnant_rounds = 0
         last_count = len(links)
+
+        if stagnant_rounds >= 5:
+            stopped_early = True
+            break
 
         try:
             scroller.hover()
@@ -189,14 +207,94 @@ def collect_card_links(page, max_results, log_fn, stop_flag):
             log_fn("⚠️ Похоже, капча. Реши её в открытом окне браузера, жду 20 сек...")
             time.sleep(20)
 
+    if stopped_early:
+        log_fn(f"Новых уникальных карточек больше нет — останавливаюсь. Собрано {len(links)} (запрошено {max_results}).")
+
     return list(links)[:max_results]
+
+
+def _pick_social_link(html, pattern):
+    """Возвращает первую ссылку соцсети, которая НЕ является кнопкой
+    "поделиться"/виджетом Яндекса (share.php, share/url и т.п.), а похожа
+    на настоящую страницу организации."""
+    for match in pattern.finditer(html):
+        candidate = match.group(0)
+        low = candidate.lower()
+        if any(kw in low for kw in SOCIAL_EXCLUDE_KEYWORDS):
+            continue
+        return candidate
+    return ""
+
+
+def _unwrap_redirect(href: str) -> str:
+    """Некоторые ссылки на сайт организации завёрнуты в редирект Яндекса
+    вида .../redir?...url=<реальный сайт>. Разворачиваем, если это так."""
+    if "url=" not in href:
+        return href
+    try:
+        from urllib.parse import urlparse, parse_qs, unquote
+        qs = parse_qs(urlparse(href).query)
+        real = qs.get("url", [""])[0]
+        return unquote(real) if real else href
+    except Exception:
+        return href
+
+
+def _looks_like_site(href: str) -> bool:
+    if not href or not href.startswith(("http://", "https://")):
+        return False
+    low = href.lower()
+    if any(dom in low for dom in IGNORE_DOMAINS):
+        return False
+    if any(kw in low for kw in SOCIAL_EXCLUDE_KEYWORDS):
+        return False
+    return True
+
+
+# Селекторы, под которыми на карточке организации в Яндекс.Картах обычно
+# лежит именно ссылка на официальный сайт (проверяем по очереди, от более
+# специфичных к более общим — так реже промахиваемся мимо рекламных
+# и сторонних ссылок).
+SITE_SELECTOR_CANDIDATES = (
+    "a[class*='business-urls-view__link']",
+    "a[class*='orgpage-header-view__link']",
+    "a[class*='business-contacts-view'][href^='http']",
+    "a[aria-label*='айт'][href^='http']",  # "Сайт" / "сайт"
+)
+
+
+def find_website(page) -> str:
+    # 1) сперва пробуем прицельные селекторы карточки организации
+    for selector in SITE_SELECTOR_CANDIDATES:
+        try:
+            loc = page.locator(selector)
+            for i in range(loc.count()):
+                href = _unwrap_redirect(loc.nth(i).get_attribute("href") or "")
+                if _looks_like_site(href):
+                    return href
+        except Exception:
+            continue
+
+    # 2) фолбэк — перебираем все внешние ссылки на странице и берём первую,
+    # которая не относится к самому Яндексу, соцсетям, агрегаторам отзывов,
+    # рекламе или трекингу (расширенный IGNORE_DOMAINS)
+    try:
+        anchors = page.locator("a[href^='http']")
+        for i in range(anchors.count()):
+            href = _unwrap_redirect(anchors.nth(i).get_attribute("href") or "")
+            if _looks_like_site(href):
+                return href
+    except Exception:
+        pass
+
+    return ""
 
 
 def extract_org_data(page, url, log_fn):
     data = {
         "Название": "", "Ссылка на карточку": url, "Адрес": "", "Телефон": "",
         "Есть сайт": "Нет", "Сайт": "", "Рейтинг": "", "Кол-во отзывов": "",
-        "VK": "", "Telegram": "", "Instagram": "", "WhatsApp": "", "Facebook": "", "OK.ru": "",
+        "VK": "", "Telegram": "", "Facebook": "",
     }
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
@@ -220,21 +318,12 @@ def extract_org_data(page, url, log_fn):
     html = page.content()
 
     for key, pattern in SOCIAL_PATTERNS.items():
-        m = pattern.search(html)
-        if m:
-            data[key] = m.group(0)
+        data[key] = _pick_social_link(html, pattern)
 
-    try:
-        contact_links = page.locator("a[href^='http']")
-        n = contact_links.count()
-        for i in range(n):
-            href = contact_links.nth(i).get_attribute("href") or ""
-            if href and not any(dom in href for dom in IGNORE_DOMAINS):
-                data["Сайт"] = href
-                data["Есть сайт"] = "Да"
-                break
-    except Exception:
-        pass
+    site = find_website(page)
+    if site:
+        data["Сайт"] = site
+        data["Есть сайт"] = "Да"
 
     try:
         addr_el = page.locator("[class*='address']").first
@@ -318,16 +407,34 @@ def run_parser(params, put_fn, stop_flag):
             links = collect_card_links(page, params["max_results"], log_fn, stop_flag)
             log_fn(f"Найдено карточек: {len(links)}")
 
+            seen_orgs = set()  # (название, адрес) в нижнем регистре — для отсева дублей
+            duplicates_skipped = 0
+
             for idx, link in enumerate(links, 1):
                 if stop_flag.is_set():
                     log_fn("Остановлено пользователем.")
                     break
                 log_fn(f"[{idx}/{len(links)}] {link}")
                 org_data = extract_org_data(page, link, log_fn)
-                results.append(org_data)
+
+                dedup_key = (org_data.get("Название", "").strip().lower(),
+                             org_data.get("Адрес", "").strip().lower())
+                is_duplicate = dedup_key != ("", "") and dedup_key in seen_orgs
+
                 put_fn({"type": "progress", "current": idx, "total": len(links)})
-                put_fn({"type": "org", "data": org_data, "idx": idx, "total": len(links)})
+
+                if is_duplicate:
+                    duplicates_skipped += 1
+                    log_fn(f"Дубликат — «{org_data.get('Название') or link}» уже собран, пропускаю.")
+                else:
+                    seen_orgs.add(dedup_key)
+                    results.append(org_data)
+                    put_fn({"type": "org", "data": org_data, "idx": len(results), "total": len(links)})
+
                 time.sleep(random.uniform(1.5, 3.5))
+
+            if duplicates_skipped:
+                log_fn(f"Пропущено дубликатов: {duplicates_skipped}.")
 
             browser.close()
     except Exception as e:
@@ -662,9 +769,23 @@ class App(ctk.CTk):
         self.tree = ttk.Treeview(
             tree_wrap, columns=TABLE_COLUMNS, show="headings", style="Dark.Treeview",
         )
+        # Фиксированная ширина под каждую колонку (stretch=False), чтобы длинные
+        # ссылки не растягивали таблицу и не вылезали за пределы своей ячейки —
+        # Treeview обрезает текст по границе колонки, а не переносит и не раздувает её.
+        COLUMN_WIDTHS = {
+            "Название": 170, "Адрес": 220, "Телефон": 110, "Сайт": 190,
+            "Рейтинг": 60, "Отзывы": 65, "VK": 170, "Telegram": 170, "Facebook": 170,
+        }
+        CENTER_COLUMNS = {"Рейтинг", "Отзывы"}
         for col in TABLE_COLUMNS:
             self.tree.heading(col, text=col.upper())
-            self.tree.column(col, width=130, anchor="w")
+            self.tree.column(
+                col,
+                width=COLUMN_WIDTHS.get(col, 140),
+                minwidth=60,
+                anchor="center" if col in CENTER_COLUMNS else "w",
+                stretch=False,
+            )
 
         vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.tree.xview)
@@ -816,7 +937,7 @@ class App(ctk.CTk):
     def _add_org(self, data, idx, total):
         self._found += 1
         has_site = data.get("Есть сайт") == "Да"
-        has_social = any(data.get(k) for k in ("VK", "Telegram", "Instagram", "WhatsApp", "Facebook", "OK.ru"))
+        has_social = any(data.get(k) for k in ("VK", "Telegram", "Facebook"))
         if has_site:
             self._with_site += 1
         if has_social:
@@ -861,21 +982,28 @@ class App(ctk.CTk):
         self._ico(icons, "W", has_site, AMBER)
         self._ico(icons, "S", has_social, GREEN)
 
-        # таблица
+        # таблица — ссылки укорачиваем для отображения (полные значения всегда
+        # остаются в итоговом Excel), чтобы они не вылезали за пределы ячейки
         self.tree.insert("", "end", values=(
             data.get("Название") or "—",
             data.get("Адрес") or "—",
             data.get("Телефон") or "—",
-            data.get("Сайт") or ("нет" if not has_site else ""),
+            self._short_url(data.get("Сайт")) if has_site else "нет",
             data.get("Рейтинг") or "—",
             data.get("Кол-во отзывов") or "—",
-            data.get("VK") or "—",
-            data.get("Telegram") or "—",
-            data.get("Instagram") or "—",
-            data.get("WhatsApp") or "—",
-            data.get("Facebook") or "—",
-            data.get("OK.ru") or "—",
+            self._short_url(data.get("VK")),
+            self._short_url(data.get("Telegram")),
+            self._short_url(data.get("Facebook")),
         ))
+
+    @staticmethod
+    def _short_url(url, max_len=34):
+        if not url:
+            return "—"
+        short = re.sub(r'^https?://(www\.)?', '', url).rstrip('/')
+        if len(short) > max_len:
+            short = short[:max_len - 1] + "…"
+        return short
 
     def _ico(self, parent, letter, found, color):
         fg = color if found else "#0D0E09"
